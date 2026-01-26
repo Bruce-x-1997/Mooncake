@@ -317,6 +317,20 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
+    const char *enable_async_memset_env = std::getenv("MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR");
+    if (enable_async_memset_env) {
+        int val = atoi(enable_async_memset_env);
+        config.enable_async_memset_before_reg_mr = (val != 0);
+    }
+
+    const char *async_memset_min_size_env = std::getenv("MC_ASYNC_MEMSET_MIN_SIZE");
+    if (async_memset_min_size_env) {
+        size_t val = atoi(async_memset_min_size_env);
+        if (val > 0) {
+            config.async_memset_min_size = val;
+        }
+    }
+
     const char *traffic_class_env = std::getenv("MC_IB_TC");
     if (traffic_class_env) {
         try {

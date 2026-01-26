@@ -261,6 +261,148 @@ def test_transfer_engine_reg_mr_overhead():
         print(f"Skipped: Transfer Engine initialization failed: {e}")
 
 
+def test_transfer_engine_async_memset_optimization():
+    """Test Transfer Engine async memset optimization before reg_mr"""
+    print("\n" + "=" * 60)
+    print("Testing Transfer Engine async memset optimization (with/without)")
+    print("=" * 60)
+    print("Note: This test compares reg_mr performance with/without async memset")
+    print("      Set MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR=1 to enable optimization")
+    print("=" * 60)
+    
+    if not torch.cuda.is_available():
+        print("Skipped: CUDA not available")
+        return
+    
+    # Test sizes that are >= async_memset_min_size (64KB default)
+    sizes = [64 * 1024,              # 64 KB (minimum threshold)
+             1 * 1024 * 1024,         # 1 MB
+             10 * 1024 * 1024,        # 10 MB
+             100 * 1024 * 1024,       # 100 MB
+             1024 * 1024 * 1024]      # 1 GB
+    
+    results = {}
+    
+    # Test with async memset disabled (default)
+    print("\n--- Testing WITHOUT async memset optimization ---")
+    original_value = os.environ.get('MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR')
+    if 'MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR' in os.environ:
+        del os.environ['MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR']
+    
+    try:
+        engine = TransferEngine()
+        import socket
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        local_server_name = f"{local_ip}:0"
+        
+        ret = engine.initialize(local_server_name, "P2PHANDSHAKE", "rdma", "")
+        if ret != 0:
+            ret = engine.initialize(local_server_name, "P2PHANDSHAKE", "tcp", "")
+            if ret != 0:
+                print(f"Skipped: Transfer Engine initialization failed: {ret}")
+                return
+        
+        for size in sizes:
+            times = []
+            for _ in range(5):
+                gpu_mem = torch.empty(size // 4, dtype=torch.float32, device='cuda')
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                
+                addr = gpu_mem.data_ptr()
+                ret = engine.register_memory(addr, size)
+                
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                
+                if ret == 0:
+                    reg_time = (end - start) * 1e6
+                    times.append(reg_time)
+                    engine.unregister_memory(addr)
+                
+                del gpu_mem
+                torch.cuda.empty_cache()
+            
+            if times:
+                avg_time = np.mean(times)
+                results[f'{size}_without'] = avg_time
+                print(f"  Size {size / 1e6:.2f} MB: {avg_time:.2f} us (avg)")
+    except Exception as e:
+        print(f"Error testing without async memset: {e}")
+    finally:
+        if original_value is not None:
+            os.environ['MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR'] = original_value
+    
+    # Test with async memset enabled
+    print("\n--- Testing WITH async memset optimization ---")
+    os.environ['MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR'] = '1'
+    
+    try:
+        # Need to create a new engine instance to pick up the new config
+        engine = TransferEngine()
+        import socket
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        local_server_name = f"{local_ip}:0"
+        
+        ret = engine.initialize(local_server_name, "P2PHANDSHAKE", "rdma", "")
+        if ret != 0:
+            ret = engine.initialize(local_server_name, "P2PHANDSHAKE", "tcp", "")
+            if ret != 0:
+                print(f"Skipped: Transfer Engine initialization failed: {ret}")
+                return
+        
+        for size in sizes:
+            times = []
+            for _ in range(5):
+                gpu_mem = torch.empty(size // 4, dtype=torch.float32, device='cuda')
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                
+                addr = gpu_mem.data_ptr()
+                ret = engine.register_memory(addr, size)
+                
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                
+                if ret == 0:
+                    reg_time = (end - start) * 1e6
+                    times.append(reg_time)
+                    engine.unregister_memory(addr)
+                
+                del gpu_mem
+                torch.cuda.empty_cache()
+            
+            if times:
+                avg_time = np.mean(times)
+                results[f'{size}_with'] = avg_time
+                print(f"  Size {size / 1e6:.2f} MB: {avg_time:.2f} us (avg)")
+    except Exception as e:
+        print(f"Error testing with async memset: {e}")
+    
+    # Compare results
+    print("\n--- Performance Comparison ---")
+    for size in sizes:
+        key_without = f'{size}_without'
+        key_with = f'{size}_with'
+        if key_without in results and key_with in results:
+            without_time = results[key_without]
+            with_time = results[key_with]
+            improvement = ((without_time - with_time) / without_time * 100) if without_time > 0 else 0
+            print(f"  Size {size / 1e6:.2f} MB:")
+            print(f"    Without optimization: {without_time:.2f} us")
+            print(f"    With optimization: {with_time:.2f} us")
+            print(f"    Improvement: {improvement:.1f}%")
+    
+    # Cleanup
+    if 'MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR' in os.environ:
+        if original_value is None:
+            del os.environ['MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR']
+        else:
+            os.environ['MC_ENABLE_ASYNC_MEMSET_BEFORE_REG_MR'] = original_value
+
+
 def test_buffer_init_overhead():
     """Test Buffer initialization overhead (includes memset and reg_mr)"""
     print("\n" + "=" * 60)
@@ -343,6 +485,10 @@ class TestMemsetRegMrOverhead(unittest.TestCase):
     def test_transfer_engine_reg_mr(self):
         """Test Transfer Engine reg_mr overhead"""
         test_transfer_engine_reg_mr_overhead()
+    
+    def test_transfer_engine_async_memset(self):
+        """Test Transfer Engine async memset optimization"""
+        test_transfer_engine_async_memset_optimization()
 
 
 def main():
@@ -379,7 +525,10 @@ def main():
         # Test 3: Transfer Engine reg_mr overhead (no distributed env needed)
         test_transfer_engine_reg_mr_overhead()
         
-        # Test 4: Buffer initialization overhead (requires distributed environment)
+        # Test 4: Transfer Engine async memset optimization (no distributed env needed)
+        test_transfer_engine_async_memset_optimization()
+        
+        # Test 5: Buffer initialization overhead (requires distributed environment)
         if dist_initialized:
             test_buffer_init_overhead()
         else:
@@ -430,3 +579,4 @@ if __name__ == "__main__":
         unittest.main(argv=sys.argv[1:])
     else:
         main()
+

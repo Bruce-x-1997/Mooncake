@@ -64,6 +64,10 @@ struct GlobalConfig {
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
+    // Enable async memset before reg_mr for GPU memory to reduce registration overhead
+    bool enable_async_memset_before_reg_mr = false;
+    // Minimum buffer size (in bytes) to trigger async memset optimization
+    size_t async_memset_min_size = 64 * 1024;  // 64KB
 };
 
 struct RpcCommunicatorConfig {

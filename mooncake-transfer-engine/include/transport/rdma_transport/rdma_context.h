@@ -88,7 +88,11 @@ class RdmaContext {
 
    private:
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
-                                     MemoryRegionMeta &mrMeta);
+                                     MemoryRegionMeta &mrMeta,
+                                     bool skip_async_memset = false);
+    
+    // Optional async memset for GPU memory before reg_mr
+    int asyncMemsetBeforeRegMr(void *addr, size_t length);
 
    public:
     bool active() const { return active_; }

@@ -211,12 +211,26 @@ int RdmaContext::deconstruct() {
 
 int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                                               int access,
-                                              MemoryRegionMeta &mrMeta) {
+                                              MemoryRegionMeta &mrMeta,
+                                              bool skip_async_memset) {
     if (length > (size_t)globalConfig().max_mr_size) {
         PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
+    
+    // Optional async memset for GPU memory before reg_mr to reduce overhead
+    // Skip memset during preTouchMemory to avoid redundant operations
+    if (!skip_async_memset &&
+        globalConfig().enable_async_memset_before_reg_mr &&
+        length >= globalConfig().async_memset_min_size) {
+        int ret = asyncMemsetBeforeRegMr(addr, length);
+        if (ret != 0) {
+            // Log warning but continue with registration
+            LOG(WARNING) << "Async memset before reg_mr failed, continuing anyway";
+        }
+    }
+    
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
@@ -303,12 +317,101 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
     MemoryRegionMeta mrMeta;
+    // Skip async memset during preTouchMemory to avoid redundant operations
     int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
-                                           mrMeta);
+                                           mrMeta, true /* skip_async_memset */);
     if (ret != 0) {
         return ret;
     }
     return ibv_dereg_mr(mrMeta.mr);
+}
+
+int RdmaContext::asyncMemsetBeforeRegMr(void *addr, size_t length) {
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+    // Check if memory is on GPU
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+    
+    // Only perform async memset for GPU device memory
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+        // Create or reuse a CUDA stream for async operations
+        static cudaStream_t memset_stream = nullptr;
+        static std::once_flag stream_init_flag;
+        
+        std::call_once(stream_init_flag, []() {
+            cudaError_t err = cudaStreamCreate(&memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "Failed to create CUDA stream for async memset: "
+                             << cudaGetErrorString(err);
+                memset_stream = nullptr;
+            }
+        });
+        
+        if (memset_stream != nullptr) {
+            // Perform async memset to zero
+            cudaError_t err = cudaMemsetAsync(addr, 0, length, memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaMemsetAsync failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+            
+            // Synchronize stream before reg_mr to ensure memset completes
+            err = cudaStreamSynchronize(memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaStreamSynchronize failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+        } else {
+            // Fallback to synchronous memset if stream creation failed
+            cudaError_t err = cudaMemset(addr, 0, length);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaMemset failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+        }
+    }
+#elif defined(USE_CUDA)
+    // For nvidia-peermem case, still check if it's GPU memory
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+    
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+        static cudaStream_t memset_stream = nullptr;
+        static std::once_flag stream_init_flag;
+        
+        std::call_once(stream_init_flag, []() {
+            cudaError_t err = cudaStreamCreate(&memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "Failed to create CUDA stream for async memset: "
+                             << cudaGetErrorString(err);
+                memset_stream = nullptr;
+            }
+        });
+        
+        if (memset_stream != nullptr) {
+            cudaError_t err = cudaMemsetAsync(addr, 0, length, memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaMemsetAsync failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+            
+            err = cudaStreamSynchronize(memset_stream);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaStreamSynchronize failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+        } else {
+            cudaError_t err = cudaMemset(addr, 0, length);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "cudaMemset failed: " << cudaGetErrorString(err);
+                return ERR_CONTEXT;
+            }
+        }
+    }
+#endif
+    return 0;
 }
 
 uint32_t RdmaContext::rkey(void *addr) {

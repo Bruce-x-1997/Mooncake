@@ -122,9 +122,20 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
     cd ..
 fi
 
-if [ "$BUILD_WITH_EP" = "1" ]; then
+# Build Mooncake PG (can be controlled independently via BUILD_WITH_PG)
+# Defaults to BUILD_WITH_EP if BUILD_WITH_PG is not set
+BUILD_WITH_PG=${BUILD_WITH_PG:-${BUILD_WITH_EP:-"0"}}
+
+if [ "$BUILD_WITH_PG" = "1" ]; then
     echo "Building Mooncake PG"
     cd mooncake-pg
+    
+    # Ensure engine.so exists (required by mooncake-pg)
+    if [ ! -f "../mooncake-wheel/mooncake/engine.so" ]; then
+        echo "Error: engine.so not found. Please build transfer engine first."
+        exit 1
+    fi
+    
     if [ -z "$EP_TORCH_VERSIONS" ]; then
         python setup.py build_ext --build-lib .
     else
@@ -140,6 +151,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
     fi
     cp mooncake/*.so ../mooncake-wheel/mooncake/
     cd ..
+    echo "Mooncake PG build completed"
 fi
 
 echo "Building wheel package..."

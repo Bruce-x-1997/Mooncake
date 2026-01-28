@@ -157,6 +157,26 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
+    // Allocate and register P2P control data buffers
+    // One buffer per peer rank, with kP2PNumSlots entries each
+    for (size_t rank = 0; rank < kMaxNumRanks; ++rank) {
+        // Send control buffer: control data we send to each peer
+        p2p_send_ctrl_[rank] = new P2PControlData[kP2PNumSlots];
+        memset(p2p_send_ctrl_[rank], 0, kP2PNumSlots * sizeof(P2PControlData));
+        rc = engine_.registerLocalMemory(
+            p2p_send_ctrl_[rank], kP2PNumSlots * sizeof(P2PControlData),
+            kWildcardLocation);
+        TORCH_CHECK(!rc, "Failed to register P2P send control buffer");
+
+        // Recv control buffer: control data we receive from each peer
+        p2p_recv_ctrl_[rank] = new P2PControlData[kP2PNumSlots];
+        memset(p2p_recv_ctrl_[rank], 0, kP2PNumSlots * sizeof(P2PControlData));
+        rc = engine_.registerLocalMemory(
+            p2p_recv_ctrl_[rank], kP2PNumSlots * sizeof(P2PControlData),
+            kWildcardLocation);
+        TORCH_CHECK(!rc, "Failed to register P2P recv control buffer");
+    }
+
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
     rank_info.recv_buffer[0] = (uint64_t)recv_buffer_[0];
@@ -167,6 +187,13 @@ MooncakeBackend::MooncakeBackend(
     rank_info.recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
     rank_info.warmup_buffer[0] = (uint64_t)warmup_send_region_;
     rank_info.warmup_buffer[1] = (uint64_t)warmup_recv_region_;
+    // Note: SegmentInfo only has [2] elements for p2p_send_ctrl/p2p_recv_ctrl
+    // We use [0] for the base address of the first buffer, and [1] for stride info
+    // Actual per-rank buffers are accessed via p2p_recv_ctrl_[rank] in code
+    rank_info.p2p_send_ctrl[0] = (uint64_t)p2p_send_ctrl_[0];
+    rank_info.p2p_send_ctrl[1] = sizeof(P2PControlData) * kP2PNumSlots;  // Stride between buffers
+    rank_info.p2p_recv_ctrl[0] = (uint64_t)p2p_recv_ctrl_[0];
+    rank_info.p2p_recv_ctrl[1] = sizeof(P2PControlData) * kP2PNumSlots;  // Stride between buffers
 
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
@@ -602,6 +629,21 @@ void MooncakeBackend::shutdown() {
     engine_.unregisterLocalMemory(warmup_recv_region_);
     delete[] warmup_send_region_;
     delete[] warmup_recv_region_;
+    
+    // Cleanup P2P control data buffers
+    for (size_t rank = 0; rank < kMaxNumRanks; ++rank) {
+        if (p2p_send_ctrl_[rank]) {
+            engine_.unregisterLocalMemory(p2p_send_ctrl_[rank]);
+            delete[] p2p_send_ctrl_[rank];
+            p2p_send_ctrl_[rank] = nullptr;
+        }
+        if (p2p_recv_ctrl_[rank]) {
+            engine_.unregisterLocalMemory(p2p_recv_ctrl_[rank]);
+            delete[] p2p_recv_ctrl_[rank];
+            p2p_recv_ctrl_[rank] = nullptr;
+        }
+    }
+    
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
@@ -900,43 +942,79 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     const int numSlotsNeeded =
         static_cast<int>((numBytes + kP2PSlotSize - 1) / kP2PSlotSize);
 
-    const std::string slotRequestKey =
-        makeP2PSlotKey(meta_.backendIndex, rank_, dstRank, tag, seq);
-    meta_.store->set(slotRequestKey, c10::str(numSlotsNeeded, "_", numBytes));
+    // Use RDMA-based control data instead of Store
+    int ctrlSlot = static_cast<int>(seq % kP2PNumSlots);
+    P2PControlData* ctrl = &p2p_send_ctrl_[dstRank][ctrlSlot];
+    
+    // Step 1: Prepare and send slot request via RDMA
+    ctrl->numSlotsNeeded = numSlotsNeeded;
+    ctrl->numBytes = numBytes;
+    ctrl->baseSlot = 0;
+    ctrl->allocatedSlots = 0;
+    ctrl->status = P2P_CTRL_REQUEST;
+    std::atomic_thread_fence(std::memory_order_release);  // Ensure writes are visible
 
-    std::vector<std::string> keys = {slotRequestKey};
+    // RDMA WRITE control data request to remote
+    // Write to dstRank's recv buffer for this rank (rank_)
+    // Each rank has separate recv buffers for each source rank: p2p_recv_ctrl_[srcRank]
+    uint64_t remoteCtrlBase = meta_.segmentInfos[dstRank].p2p_recv_ctrl[0];
+    uint64_t remoteCtrlStride = meta_.segmentInfos[dstRank].p2p_recv_ctrl[1];
+    uint64_t remoteCtrlAddr = remoteCtrlBase + rank_ * remoteCtrlStride + 
+                              ctrlSlot * sizeof(P2PControlData);
+    
+    std::vector<TransferRequest> ctrlEntries;
+    ctrlEntries.push_back(TransferRequest{
+        .opcode = TransferRequest::WRITE,
+        .source = ctrl,
+        .target_id = meta_.segmentIDs[dstRank],
+        .target_offset = remoteCtrlAddr,
+        .length = sizeof(P2PControlData),
+    });
+    auto ctrlBatchID = meta_.engine->allocateBatchID(1);
+    meta_.engine->submitTransfer(ctrlBatchID, ctrlEntries);
+
+    // Step 2: Wait for receiver's slot allocation reply
+    // Poll local recv control buffer (receiver writes reply via RDMA)
     int baseSlot = 0;
     int allocatedSlots = 0;
+    P2PControlData* reply = &p2p_recv_ctrl_[dstRank][ctrlSlot];
+    
+    // Wait for RDMA write to complete first
+    TransferStatus ctrlStatus;
     while (true) {
-        if (meta_.store->check(keys)) {
-            auto slotValue = meta_.store->get(slotRequestKey);
-            std::string slotStr(slotValue.begin(), slotValue.end());
-            size_t firstUnderscore = slotStr.find('_');
-            if (firstUnderscore != std::string::npos) {
-                try {
-                    int firstNum =
-                        std::stoi(slotStr.substr(0, firstUnderscore));
-                    int secondNum =
-                        std::stoi(slotStr.substr(firstUnderscore + 1));
-                    if (secondNum <= static_cast<int>(kP2PNumSlots) &&
-                        firstNum < static_cast<int>(kP2PNumSlots) &&
-                        secondNum == numSlotsNeeded) {
-                        baseSlot = firstNum;
-                        allocatedSlots = secondNum;
-                        break;
-                    }
-                } catch (const std::exception&) {
-                    // Invalid format, keep waiting.
-                }
-            }
+        meta_.engine->getTransferStatus(ctrlBatchID, 0, ctrlStatus);
+        if (ctrlStatus.s == TransferStatusEnum::COMPLETED) {
+            break;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
+        TORCH_CHECK(ctrlStatus.s != TransferStatusEnum::FAILED,
+                    "P2P send control data transfer failed.");
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
     }
 
-    const std::string ctrlKey =
-        makeP2PCtrlKey(meta_.backendIndex, rank_, dstRank, tag, seq);
-    uint64_t sendAddrBase = meta_.segmentInfos[rank_].send_buffer[0];
+    // Poll for receiver's reply (receiver writes to our recv_ctrl buffer via RDMA)
+    int retry = 0;
+    const int maxRetries = 1000000;  // Timeout protection
+    while (retry < maxRetries) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (reply->status == P2P_CTRL_ALLOCATED && 
+            reply->allocatedSlots == numSlotsNeeded) {
+            baseSlot = reply->baseSlot;
+            allocatedSlots = reply->allocatedSlots;
+            break;
+        }
+        if (retry < 100) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+        } else if (retry < 1000) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        retry++;
+    }
+    TORCH_CHECK(retry < maxRetries, "P2P send: timeout waiting for slot allocation");
 
+    // Step 3: Copy data to send buffer
+    uint64_t sendAddrBase = meta_.segmentInfos[rank_].send_buffer[0];
     uint64_t sendAddr = sendAddrBase + baseSlot * kP2PSlotSize;
     void* sendBuf = reinterpret_cast<void*>(sendAddr);
 
@@ -950,8 +1028,9 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
             !err, "P2P send cudaMemcpyAsync failed: ", cudaGetErrorString(err));
         cudaStreamSynchronize(stream);
     }
-    uint64_t remoteRecvAddrBase = meta_.segmentInfos[dstRank].recv_buffer[0];
 
+    // Step 4: Transfer data via RDMA
+    uint64_t remoteRecvAddrBase = meta_.segmentInfos[dstRank].recv_buffer[0];
     uint64_t remoteRecvAddr = remoteRecvAddrBase + baseSlot * kP2PSlotSize;
     std::vector<TransferRequest> entries;
     entries.push_back(TransferRequest{
@@ -974,8 +1053,33 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
                     "P2P send transfer failed.");
     }
 
-    meta_.store->set(ctrlKey,
-                     c10::str(baseSlot, "_", allocatedSlots, "_", numBytes));
+    // Step 5: Send control message (confirm slot and size) via RDMA
+    ctrl->baseSlot = baseSlot;
+    ctrl->allocatedSlots = allocatedSlots;
+    ctrl->numBytes = numBytes;
+    ctrl->status = P2P_CTRL_CTRL_MSG;
+    std::atomic_thread_fence(std::memory_order_release);
+
+    ctrlEntries.clear();
+    ctrlEntries.push_back(TransferRequest{
+        .opcode = TransferRequest::WRITE,
+        .source = ctrl,
+        .target_id = meta_.segmentIDs[dstRank],
+        .target_offset = remoteCtrlAddr,
+        .length = sizeof(P2PControlData),
+    });
+    ctrlBatchID = meta_.engine->allocateBatchID(1);
+    meta_.engine->submitTransfer(ctrlBatchID, ctrlEntries);
+
+    // Wait for control message to be sent
+    while (true) {
+        meta_.engine->getTransferStatus(ctrlBatchID, 0, ctrlStatus);
+        if (ctrlStatus.s == TransferStatusEnum::COMPLETED) {
+            break;
+        }
+        TORCH_CHECK(ctrlStatus.s != TransferStatusEnum::FAILED,
+                    "P2P send control message transfer failed.");
+    }
 }
 
 void MooncakeBackend::processRecvOp(const P2POp& op) {
@@ -987,96 +1091,144 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     const auto expectedBytes =
         tensor.numel() * static_cast<size_t>(tensor.element_size());
 
+    int ctrlSlot = static_cast<int>(seq % kP2PNumSlots);
     int baseSlot = static_cast<int>(seq % kP2PNumSlots);
 
-    const std::string slotRequestKey =
-        makeP2PSlotKey(meta_.backendIndex, srcRank, rank_, tag, seq);
-    std::vector<std::string> keys = {slotRequestKey};
-    while (!meta_.store->check(keys)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    // Use RDMA-based control data instead of Store
+    // Step 1: Wait for sender's slot request (poll local recv control buffer)
+    P2PControlData* request = &p2p_recv_ctrl_[srcRank][ctrlSlot];
+    
+    int retry = 0;
+    const int maxRetries = 1000000;  // Timeout protection
+    while (retry < maxRetries) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (request->status == P2P_CTRL_REQUEST) {
+            break;
+        }
+        if (retry < 100) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+        } else if (retry < 1000) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        retry++;
+    }
+    TORCH_CHECK(retry < maxRetries, "P2P recv: timeout waiting for slot request");
+
+    // Step 2: Read request parameters
+    int numSlotsNeeded = request->numSlotsNeeded;
+    int64_t numBytes = request->numBytes;
+    TORCH_CHECK(numBytes == expectedBytes,
+                "P2P recv: tensor byte size mismatch, expected ", expectedBytes,
+                " bytes but got ", numBytes, " bytes.");
+
+    // Step 3: Handle in-flight operations (wait for previous operations to complete)
+    while (seq >= meta_.p2pRecvLowestInFlight[srcRank] + kP2PNumSlots) {
+        const int64_t waitSeq = meta_.p2pRecvLowestInFlight[srcRank];
+        int waitCtrlSlot = static_cast<int>(waitSeq % kP2PNumSlots);
+        P2PControlData* waitCtrl = &p2p_recv_ctrl_[srcRank][waitCtrlSlot];
+        
+        // Wait for done flag via RDMA (poll local buffer)
+        retry = 0;
+        while (retry < maxRetries && waitCtrl->status != P2P_CTRL_DONE) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (retry < 100) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(1));
+            }
+            retry++;
+        }
+        if (waitCtrl->status == P2P_CTRL_DONE) {
+            waitCtrl->status = P2P_CTRL_IDLE;  // Reset for reuse
+            ++meta_.p2pRecvLowestInFlight[srcRank];
+        } else {
+            TORCH_CHECK(false, "P2P recv: timeout waiting for in-flight operation");
+        }
     }
 
-    auto requestValue = meta_.store->get(slotRequestKey);
-    std::string requestStr(requestValue.begin(), requestValue.end());
-    int numSlotsNeeded = 0;
-    size_t numBytes = 0;
-    try {
-        size_t firstUnderscore = requestStr.find('_');
-        TORCH_CHECK(firstUnderscore != std::string::npos,
-                    "P2P recv: invalid slot request format: ", requestStr);
-        numSlotsNeeded = std::stoi(requestStr.substr(0, firstUnderscore));
-        numBytes = static_cast<size_t>(
-            std::stoull(requestStr.substr(firstUnderscore + 1)));
-    } catch (const std::exception& e) {
-        TORCH_CHECK(false,
-                    "P2P recv: failed to parse slot request: ", e.what());
-    }
-
+    // Step 4: Allocate slot and send reply via RDMA
     if (baseSlot + numSlotsNeeded > static_cast<int>(kP2PNumSlots)) {
         baseSlot = 0;
     }
 
-    while (seq >= meta_.p2pRecvLowestInFlight[srcRank] + kP2PNumSlots) {
-        const int64_t waitSeq = meta_.p2pRecvLowestInFlight[srcRank];
-        const std::string doneKey =
-            makeP2PDoneKey(meta_.backendIndex, srcRank, rank_, tag, waitSeq);
-        std::vector<std::string> doneKeys = {doneKey};
-        while (!meta_.store->check(doneKeys)) {
+    P2PControlData* reply = &p2p_send_ctrl_[srcRank][ctrlSlot];
+    reply->baseSlot = baseSlot;
+    reply->allocatedSlots = numSlotsNeeded;
+    reply->numBytes = numBytes;
+    reply->status = P2P_CTRL_ALLOCATED;
+    std::atomic_thread_fence(std::memory_order_release);
+
+    // RDMA WRITE reply to sender's recv control buffer
+    // Write to srcRank's recv buffer for this rank (rank_)
+    uint64_t remoteCtrlBase = meta_.segmentInfos[srcRank].p2p_recv_ctrl[0];
+    uint64_t remoteCtrlStride = meta_.segmentInfos[srcRank].p2p_recv_ctrl[1];
+    uint64_t remoteCtrlAddr = remoteCtrlBase + rank_ * remoteCtrlStride + 
+                              ctrlSlot * sizeof(P2PControlData);
+    
+    std::vector<TransferRequest> ctrlEntries;
+    ctrlEntries.push_back(TransferRequest{
+        .opcode = TransferRequest::WRITE,
+        .source = reply,
+        .target_id = meta_.segmentIDs[srcRank],
+        .target_offset = remoteCtrlAddr,
+        .length = sizeof(P2PControlData),
+    });
+    auto ctrlBatchID = meta_.engine->allocateBatchID(1);
+    meta_.engine->submitTransfer(ctrlBatchID, ctrlEntries);
+
+    // Wait for reply to be sent
+    TransferStatus ctrlStatus;
+    while (true) {
+        meta_.engine->getTransferStatus(ctrlBatchID, 0, ctrlStatus);
+        if (ctrlStatus.s == TransferStatusEnum::COMPLETED) {
+            break;
+        }
+        TORCH_CHECK(ctrlStatus.s != TransferStatusEnum::FAILED,
+                    "P2P recv control reply transfer failed.");
+    }
+
+    // Step 5: Wait for data to arrive (via Transfer Engine, already handled by sender)
+    // The data is written directly to recv_buffer by the sender via RDMA
+
+    // Step 6: Wait for control message (sender confirms slot and size)
+    retry = 0;
+    while (retry < maxRetries) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (request->status == P2P_CTRL_CTRL_MSG) {
+            // Verify control message
+            TORCH_CHECK(request->baseSlot == baseSlot,
+                        "P2P recv: slot mismatch, expected ", baseSlot,
+                        " but sender reported ", request->baseSlot);
+            TORCH_CHECK(request->allocatedSlots == numSlotsNeeded,
+                        "P2P recv: slot count mismatch, expected ", numSlotsNeeded,
+                        " but got ", request->allocatedSlots);
+            TORCH_CHECK(request->numBytes == numBytes,
+                        "P2P recv: byte size mismatch, expected ", numBytes,
+                        " but sender reported ", request->numBytes);
+            break;
+        }
+        if (retry < 100) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+        } else if (retry < 1000) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+        } else {
             std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
-        meta_.store->get(doneKey);
-        ++meta_.p2pRecvLowestInFlight[srcRank];
+        retry++;
     }
+    TORCH_CHECK(retry < maxRetries, "P2P recv: timeout waiting for control message");
 
-    meta_.store->set(slotRequestKey, c10::str(baseSlot, "_", numSlotsNeeded));
-
-    const std::string ctrlKey =
-        makeP2PCtrlKey(meta_.backendIndex, srcRank, rank_, tag, seq);
-
-    std::vector<std::string> ctrlKeys = {ctrlKey};
-    while (!meta_.store->check(ctrlKeys)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-    }
-    auto ctrlValue = meta_.store->get(ctrlKey);
-    std::string ctrlStr(ctrlValue.begin(), ctrlValue.end());
-    int numSlots = 0;
-    try {
-        size_t firstUnderscore = ctrlStr.find('_');
-        TORCH_CHECK(firstUnderscore != std::string::npos,
-                    "P2P recv: invalid control message format: ", ctrlStr);
-        int ctrlBaseSlot = std::stoi(ctrlStr.substr(0, firstUnderscore));
-        TORCH_CHECK(ctrlBaseSlot == baseSlot,
-                    "P2P recv: slot mismatch, expected ", baseSlot,
-                    " but sender reported ", ctrlBaseSlot);
-        size_t secondUnderscore = ctrlStr.find('_', firstUnderscore + 1);
-        TORCH_CHECK(secondUnderscore != std::string::npos,
-                    "P2P recv: invalid control message format: ", ctrlStr);
-        numSlots = std::stoi(ctrlStr.substr(
-            firstUnderscore + 1, secondUnderscore - firstUnderscore - 1));
-        size_t ctrlNumBytes = static_cast<size_t>(
-            std::stoull(ctrlStr.substr(secondUnderscore + 1)));
-        TORCH_CHECK(ctrlNumBytes == numBytes,
-                    "P2P recv: byte size mismatch, expected ", numBytes,
-                    " but sender reported ", ctrlNumBytes);
-    } catch (const std::exception& e) {
-        TORCH_CHECK(false,
-                    "P2P recv: failed to parse control message: ", e.what());
-    }
-    TORCH_CHECK(numBytes == expectedBytes,
-                "P2P recv: tensor byte size mismatch for key ", ctrlKey,
-                ", expected ", expectedBytes, " bytes but got ", numBytes,
-                " bytes.");
+    // Step 7: Copy data from recv buffer to tensor
     TORCH_CHECK(baseSlot >= 0 && baseSlot < static_cast<int>(kP2PNumSlots),
                 "P2P recv: invalid base slot index: ", baseSlot);
     TORCH_CHECK(
-        numSlots > 0 && baseSlot + numSlots <= static_cast<int>(kP2PNumSlots),
+        numSlotsNeeded > 0 && baseSlot + numSlotsNeeded <= static_cast<int>(kP2PNumSlots),
         "P2P recv: invalid slot range: baseSlot=", baseSlot,
-        ", numSlots=", numSlots);
-    TORCH_CHECK(numSlots == numSlotsNeeded,
-                "P2P recv: slot count mismatch, expected ", numSlotsNeeded,
-                " but got ", numSlots);
-    uint64_t recvAddrBase = meta_.segmentInfos[rank_].recv_buffer[0];
+        ", numSlots=", numSlotsNeeded);
 
+    uint64_t recvAddrBase = meta_.segmentInfos[rank_].recv_buffer[0];
     uint64_t recvAddr = recvAddrBase + baseSlot * kP2PSlotSize;
     void* recvBuf = reinterpret_cast<void*>(recvAddr);
 
@@ -1095,9 +1247,34 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
         op.originalTensor.copy_(tensor);
     }
 
-    const std::string doneKey =
-        makeP2PDoneKey(meta_.backendIndex, srcRank, rank_, tag, seq);
-    meta_.store->set(doneKey, "1");
+    // Step 8: Send done flag via RDMA
+    reply->status = P2P_CTRL_DONE;
+    std::atomic_thread_fence(std::memory_order_release);
+
+    ctrlEntries.clear();
+    ctrlEntries.push_back(TransferRequest{
+        .opcode = TransferRequest::WRITE,
+        .source = reply,
+        .target_id = meta_.segmentIDs[srcRank],
+        .target_offset = remoteCtrlAddr,
+        .length = sizeof(P2PControlData),
+    });
+    ctrlBatchID = meta_.engine->allocateBatchID(1);
+    meta_.engine->submitTransfer(ctrlBatchID, ctrlEntries);
+
+    // Wait for done flag to be sent
+    while (true) {
+        meta_.engine->getTransferStatus(ctrlBatchID, 0, ctrlStatus);
+        if (ctrlStatus.s == TransferStatusEnum::COMPLETED) {
+            break;
+        }
+        TORCH_CHECK(ctrlStatus.s != TransferStatusEnum::FAILED,
+                    "P2P recv done flag transfer failed.");
+    }
+
+    // Reset control data for reuse
+    request->status = P2P_CTRL_IDLE;
+    reply->status = P2P_CTRL_IDLE;
 
     if (seq == meta_.p2pRecvLowestInFlight[srcRank]) {
         ++meta_.p2pRecvLowestInFlight[srcRank];
